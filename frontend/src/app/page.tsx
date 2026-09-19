@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useState, useEffect } from "react";
+import React, { useState } from "react";
 import {
   LiveKitRoom,
   RoomAudioRenderer,
@@ -9,7 +9,7 @@ import {
   useDataChannel,
   useLocalParticipant,
 } from "@livekit/components-react";
-import { Mic, MicOff, PhoneOff, MessageSquare, Send, Bot, User, Radio } from "lucide-react";
+import { Mic, MicOff, PhoneOff, MessageSquare, Send, Bot, User, Radio, AlertCircle } from "lucide-react";
 
 interface ChatMessage {
   id: string;
@@ -27,8 +27,9 @@ export default function Home() {
   const [joined, setJoined] = useState<boolean>(false);
   const [loading, setLoading] = useState<boolean>(false);
   const [error, setError] = useState<string>("");
-
-  const wsUrl = process.env.NEXT_PUBLIC_LIVEKIT_URL || "wss://demo.livekit.cloud";
+  const [serverUrl, setServerUrl] = useState<string>(
+    process.env.NEXT_PUBLIC_LIVEKIT_URL || ""
+  );
 
   const handleJoin = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -47,6 +48,12 @@ export default function Home() {
         throw new Error(data.error || "Failed to fetch access token");
       }
 
+      const activeUrl = data.serverUrl || process.env.NEXT_PUBLIC_LIVEKIT_URL;
+      if (!activeUrl) {
+        throw new Error("LiveKit WebSocket URL is missing. Set NEXT_PUBLIC_LIVEKIT_URL in your .env file.");
+      }
+
+      setServerUrl(activeUrl);
       setToken(data.token);
       setJoined(true);
     } catch (err: any) {
@@ -61,7 +68,7 @@ export default function Home() {
     setJoined(false);
   };
 
-  if (!joined || !token) {
+  if (!joined || !token || !serverUrl) {
     return (
       <main className="join-container">
         <div className="join-card glass-panel">
@@ -97,7 +104,26 @@ export default function Home() {
               />
             </div>
 
-            {error && <div style={{ color: "#ef4444", fontSize: "0.85rem", marginBottom: "12px" }}>{error}</div>}
+            {error && (
+              <div
+                style={{
+                  background: "rgba(239, 68, 68, 0.15)",
+                  border: "1px solid rgba(239, 68, 68, 0.4)",
+                  color: "#fca5a5",
+                  padding: "10px 14px",
+                  borderRadius: "8px",
+                  fontSize: "0.85rem",
+                  marginBottom: "16px",
+                  display: "flex",
+                  alignItems: "center",
+                  gap: "8px",
+                  textAlign: "left",
+                }}
+              >
+                <AlertCircle size={18} style={{ flexShrink: 0 }} />
+                <span>{error}</span>
+              </div>
+            )}
 
             <button id="join-room-btn" type="submit" className="join-btn" disabled={loading}>
               {loading ? "Connecting..." : "Join Voice Room"}
@@ -111,11 +137,27 @@ export default function Home() {
   return (
     <LiveKitRoom
       video={false}
-      audio={true}
+      audio={false}
       token={token}
-      serverUrl={wsUrl}
+      serverUrl={serverUrl}
+      connect={true}
       data-lk-theme="default"
-      onDisconnected={handleLeave}
+      onError={(err) => {
+        console.error("LiveKit Room Error:", err);
+        setError(`LiveKit Error: ${err.message || err}`);
+        setJoined(false);
+        setToken("");
+      }}
+      onDisconnected={(reason) => {
+        console.warn("LiveKit Room Disconnected:", reason);
+        if (reason) {
+          setError(`Disconnected: ${reason}`);
+        } else {
+          setError("Disconnected from LiveKit server. Please check your credentials and server URL.");
+        }
+        setJoined(false);
+        setToken("");
+      }}
       style={{ height: "100vh" }}
     >
       <RoomContent roomName={roomName} username={username} onLeave={handleLeave} />
@@ -144,7 +186,11 @@ function RoomContent({ roomName, username, onLeave }: { roomName: string; userna
   const isMuted = !localParticipant.isMicrophoneEnabled;
 
   const toggleMic = async () => {
-    await localParticipant.setMicrophoneEnabled(isMuted);
+    try {
+      await localParticipant.setMicrophoneEnabled(isMuted);
+    } catch (err) {
+      console.error("Failed to toggle microphone:", err);
+    }
   };
 
   const handleSendMessage = (e: React.FormEvent) => {
@@ -159,7 +205,9 @@ function RoomContent({ roomName, username, onLeave }: { roomName: string; userna
     };
 
     const encoder = new TextEncoder();
-    send(encoder.encode(JSON.stringify(chatMsg)), { reliable: true });
+    if (send) {
+      send(encoder.encode(JSON.stringify(chatMsg)), { reliable: true });
+    }
     setMessages((prev) => [...prev, chatMsg]);
     setInputMsg("");
   };
