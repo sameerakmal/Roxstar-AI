@@ -27,6 +27,10 @@ class EdgeTTSChunkedStream(tts.ChunkedStream):
         self._text = input_text
 
     async def _run(self):
+        if not self._text or not self._text.strip():
+            logger.debug("[TTS] event=empty_text_skipped")
+            return
+
         try:
             communicate = edge_tts.Communicate(self._text, self._voice)
             mp3_bytes = bytearray()
@@ -35,6 +39,7 @@ class EdgeTTSChunkedStream(tts.ChunkedStream):
                     mp3_bytes.extend(chunk["data"])
 
             if not mp3_bytes:
+                logger.warning("[TTS] event=empty_audio_received")
                 return
 
             container = av.open(io.BytesIO(mp3_bytes))
@@ -72,5 +77,9 @@ class EdgeTTSChunkedStream(tts.ChunkedStream):
                         frame=rtc_frame,
                     )
                 )
+        except asyncio.CancelledError:
+            logger.debug("[TTS] event=synthesis_cancelled")
+            raise
         except Exception as e:
-            logger.error(f"EdgeTTS synthesis failed: {e}")
+            logger.error(f"[TTS] event=synthesis_error error='{str(e)}'")
+

@@ -185,11 +185,24 @@ class RoomHistoryManager:
         try:
             raw_str = data_bytes.decode("utf-8")
             data = json.loads(raw_str)
-            if data.get("type") == "room_turn" and "turn" in data:
-                return RoomTurn.from_dict(data["turn"])
+            if not isinstance(data, dict):
+                logger.warning("[ROOM] event=context_sync_malformed_ignored reason=not_a_dict")
+                return None
+            event_type = data.get("type")
+            if event_type != "room_turn":
+                logger.debug(f"[ROOM] event=unknown_event_type_ignored type='{event_type}'")
+                return None
+            turn_data = data.get("turn")
+            if not isinstance(turn_data, dict):
+                logger.warning("[ROOM] event=context_sync_malformed_ignored reason=missing_turn_data")
+                return None
+            if not turn_data.get("turn_id") or not turn_data.get("speaker") or not str(turn_data.get("text", "")).strip():
+                logger.warning("[ROOM] event=context_sync_malformed_ignored reason=incomplete_turn_fields")
+                return None
+            return RoomTurn.from_dict(turn_data)
         except Exception as e:
-            logger.debug(f"[RoomHistory] Failed to deserialize DataChannel turn event: {e}")
-        return None
+            logger.warning(f"[ROOM] event=context_sync_malformed_ignored error='{str(e)}'")
+            return None
 
     def clear(self):
         """Clears all turns and seen turn IDs."""

@@ -69,15 +69,27 @@ logging.basicConfig(
 )
 logger = logging.getLogger(AGENT_NAME)
 
-# Graceful Groq STT Subclass for HTTP 429 Rate Limit Handling
+def sanitize_log_message(msg: str) -> str:
+    """Masks any API keys, tokens, or authorization credentials in error strings."""
+    if not msg:
+        return ""
+    # Mask OpenRouter / OpenAI keys (sk-...)
+    msg = re.sub(r'sk-[a-zA-Z0-9_\-]{8,}', '[REDACTED_API_KEY]', msg)
+    # Mask Groq keys
+    msg = re.sub(r'g[s]k_[a-zA-Z0-9_\-]{8,}', '[REDACTED_API_KEY]', msg)
+    # Mask Authorization headers / bearer tokens
+    msg = re.sub(r'(?:bearer|token|key|secret)[=:\s]+["\']?[a-zA-Z0-9_\-]{14,}["\']?', '[REDACTED_CREDENTIAL]', msg, flags=re.IGNORECASE)
+    return msg
+
+# Graceful Groq STT Subclass for Rate Limit & Network Error Handling
 class GracefulGroqSTT(groq.STT):
     async def _recognize_impl(self, buffer, *, language, conn_options):
         try:
             return await super()._recognize_impl(buffer, language=language, conn_options=conn_options)
-        except (openai_sdk.RateLimitError, openai_sdk.APIStatusError, Exception) as e:
-            status_code = getattr(e, "status_code", 429)
+        except (openai_sdk.RateLimitError, openai_sdk.APIStatusError, openai_sdk.APIConnectionError, openai_sdk.APITimeoutError, Exception) as e:
+            status_code = getattr(e, "status_code", 429 if isinstance(e, openai_sdk.RateLimitError) else "error")
             err_str = str(e).lower()
-            if status_code == 429 or "rate_limit" in err_str or "429" in err_str:
+            if status_code == 429 or "rate_limit" in err_str or "429" in err_str or isinstance(e, openai_sdk.RateLimitError):
                 retry_delay = 0.0
                 response = getattr(e, "response", None)
                 if response and hasattr(response, "headers"):
@@ -96,14 +108,21 @@ class GracefulGroqSTT(groq.STT):
                             pass
 
                 logger.warning(
-                    f"[{DISPLAY_NAME} Warning] Groq STT HTTP 429 Rate Limit hit (20 RPM limit). "
-                    f"Retry-after timing: {retry_delay:.1f}s. Returning empty transcript gracefully."
+                    f"[STT] bot={DISPLAY_NAME} event=rate_limited retry_after={retry_delay:.1f}s"
                 )
                 return stt.SpeechEvent(
                     type=stt.SpeechEventType.FINAL_TRANSCRIPT,
                     alternatives=[stt.SpeechData(text="", language="")],
                 )
-            raise
+            else:
+                clean_err = sanitize_log_message(str(e))
+                logger.error(
+                    f"[STT] bot={DISPLAY_NAME} event=provider_error status={status_code} error='{clean_err}'"
+                )
+                return stt.SpeechEvent(
+                    type=stt.SpeechEventType.FINAL_TRANSCRIPT,
+                    alternatives=[stt.SpeechData(text="", language="")],
+                )
 
 # Roxstar AI Dost Persona System Prompt
 DOST_SYSTEM_PROMPT = """
@@ -177,24 +196,91 @@ def is_human_participant(p: rtc.RemoteParticipant) -> bool:
         
     return True
 
-async def _strip_async_stream(stream: AsyncIterable[str]) -> AsyncIterable[str]:
-    """Helper to strip internal speaker labels from streaming LLM output before TTS."""
+async def _resilient_tts_stream(
+    stream: AsyncIterable[str],
+    bot_name: str,
+    agent_inst: VoicePipelineAgent | None = None,
+    turn_id: str | None = None,
+) -> AsyncIterable[str]:
+    """
+    Consumes streaming LLM chunks safely:
+    - Strips internal speaker metadata labels.
+    - Yields clean chunks to TTS.
+    - If LLM fails or returns empty, provides a natural persona fallback response.
+    - If turn is interrupted/cancelled, suppresses late output.
+    """
     first_buffer = ""
     stripped = False
-    async for chunk in stream:
-        if not stripped:
-            first_buffer += chunk
-            if ":" in first_buffer or len(first_buffer) > 40:
-                cleaned = strip_speaker_labels(first_buffer)
-                stripped = True
-                if cleaned:
-                    yield cleaned
-        else:
-            yield chunk
-    if not stripped and first_buffer:
-        cleaned = strip_speaker_labels(first_buffer)
-        if cleaned:
-            yield cleaned
+    yielded_any = False
+
+    try:
+        async for chunk in stream:
+            # Stale turn protection: check if speech was interrupted
+            if agent_inst is not None and getattr(agent_inst, "_playing_speech", None):
+                if getattr(agent_inst._playing_speech, "interrupted", False):
+                    logger.info(f"[TURN] turn_id={turn_id} event=stale_output_suppressed")
+                    return
+
+            if not stripped:
+                first_buffer += chunk
+                if ":" in first_buffer or len(first_buffer) > 40:
+                    cleaned = strip_speaker_labels(first_buffer)
+                    stripped = True
+                    if cleaned:
+                        yielded_any = True
+                        yield cleaned
+            else:
+                if chunk:
+                    yielded_any = True
+                    yield chunk
+
+        if not stripped and first_buffer:
+            cleaned = strip_speaker_labels(first_buffer)
+            if cleaned:
+                yielded_any = True
+                yield cleaned
+
+        # Handle empty/whitespace-only LLM output
+        if not yielded_any:
+            is_interrupted = False
+            if agent_inst is not None and getattr(agent_inst, "_playing_speech", None):
+                is_interrupted = getattr(agent_inst._playing_speech, "interrupted", False)
+
+            if is_interrupted:
+                logger.info(f"[TURN] turn_id={turn_id} event=stale_output_suppressed")
+                return
+
+            fallback = (
+                "Thoda technical issue aa gaya. Ek baar phir poochho."
+                if bot_name.lower() == "dost"
+                else "Kuch technical problem aa gayi hai. Kripya ek baar phir poochhiye."
+            )
+            logger.warning(f"[LLM] bot={bot_name} event=empty_response status=fallback")
+            yield fallback
+
+    except Exception as e:
+        is_interrupted = False
+        if agent_inst is not None and getattr(agent_inst, "_playing_speech", None):
+            is_interrupted = getattr(agent_inst._playing_speech, "interrupted", False)
+
+        status_code = getattr(e, "status_code", "error")
+        clean_err = sanitize_log_message(str(e))
+        logger.error(
+            f"[LLM] bot={bot_name} event=provider_error status={status_code} error='{clean_err}' interrupted={is_interrupted}"
+        )
+
+        if is_interrupted:
+            logger.info(f"[TURN] turn_id={turn_id} event=stale_output_suppressed")
+            return
+
+        if not yielded_any:
+            fallback = (
+                "Thoda technical issue aa gaya. Ek baar phir poochho."
+                if bot_name.lower() == "dost"
+                else "Kuch technical problem aa gayi hai. Kripya ek baar phir poochhiye."
+            )
+            logger.info(f"[LLM] bot={bot_name} event=yielding_fallback text='{fallback}'")
+            yield fallback
 
 # Speech session turn owner lock to prevent split STT chunks from shifting turn ownership mid-speech
 def before_tts_cb(agent_inst: VoicePipelineAgent | None, text: str | AsyncIterable[str], is_sathi: bool | None = None):
@@ -218,9 +304,18 @@ def before_tts_cb(agent_inst: VoicePipelineAgent | None, text: str | AsyncIterab
     logger.info(f"[BotLifecycle] bot={bot_name} event=tts_started")
 
     if isinstance(text, str):
-        return strip_speaker_labels(text)
+        cleaned = strip_speaker_labels(text)
+        if not cleaned:
+            fallback = (
+                "Thoda technical issue aa gaya. Ek baar phir poochho."
+                if not is_sathi
+                else "Kuch technical problem aa gayi hai. Kripya ek baar phir poochhiye."
+            )
+            logger.warning(f"[LLM] bot={bot_name} event=empty_response status=fallback")
+            return fallback
+        return cleaned
     elif isinstance(text, AsyncIterable):
-        return _strip_async_stream(text)
+        return _resilient_tts_stream(text, bot_name=bot_name, agent_inst=agent_inst)
     return text
 
 async def before_llm_cb(
@@ -233,7 +328,12 @@ async def before_llm_cb(
     if is_sathi is None:
         is_sathi = IS_SATHI
     bot_name = "Sathi" if is_sathi else "Dost"
-    task_id = f"{bot_name.lower()}-task-{int(time.time()*1000) % 100000}"
+    turn_start_time = time.time()
+    task_id = f"{bot_name.lower()}-task-{int(turn_start_time * 1000) % 100000}"
+    if agent_inst is not None:
+        setattr(agent_inst, "_current_turn_start_time", turn_start_time)
+        setattr(agent_inst, "_current_task_id", task_id)
+
     user_input = ""
     if chat_ctx.messages:
         for msg in reversed(chat_ctx.messages):
@@ -254,6 +354,7 @@ async def before_llm_cb(
     logger.info(f"[TranscriptState] bot={bot_name} before_llm _transcribed_text='{_transcribed_text_val}'")
     logger.info(f"[BotLifecycle] bot={bot_name} event=turn_received transcript='{user_input}'")
     logger.info(f"[RoutingDebug] bot={bot_name} input='{user_input}'")
+    logger.info(f"[Latency] bot={bot_name} task={task_id} event=turn_started")
 
     # Gate 1: Suppress empty or continue prompts
     if not user_input_clean or user_input_clean == "<continue>":
@@ -286,11 +387,19 @@ async def before_llm_cb(
         human_turn = room_history.create_human_turn(user_input_clean)
         added = room_history.add_turn(human_turn)
         if added and room and hasattr(room, "local_participant") and room.local_participant:
+            async def _safe_publish_human(payload_bytes: bytes):
+                try:
+                    await room.local_participant.publish_data(payload_bytes, topic="room_context", reliable=True)
+                except Exception as pub_err:
+                    clean_err = sanitize_log_message(str(pub_err))
+                    logger.warning(f"[ROOM] event=context_sync_error error='{clean_err}'")
+
             try:
                 payload = room_history.serialize_turn_event(human_turn)
-                asyncio.create_task(room.local_participant.publish_data(payload, topic="room_context", reliable=True))
+                asyncio.create_task(_safe_publish_human(payload))
             except Exception as pub_err:
-                logger.warning(f"[RoomHistory] Failed to publish human turn DataChannel event: {pub_err}")
+                clean_err = sanitize_log_message(str(pub_err))
+                logger.warning(f"[ROOM] event=context_sync_error error='{clean_err}'")
 
         sys_prompt = SATHI_SYSTEM_PROMPT if is_sathi else DOST_SYSTEM_PROMPT
         new_ctx = room_history.build_chat_context(sys_prompt, is_sathi=is_sathi)
@@ -437,15 +546,28 @@ async def entrypoint(ctx: JobContext):
         clean_content = strip_speaker_labels(msg.content or "")
         logger.info(f"[{AGENT_NAME}] [Turn Lifecycle] LLM generation completed: '{clean_content}'")
 
+        turn_start = getattr(agent, "_current_turn_start_time", None)
+        if turn_start:
+            total_duration_ms = int((time.time() - turn_start) * 1000)
+            logger.info(f"[Latency] bot={bot_name} event=turn_completed total_ms={total_duration_ms}")
+
         if clean_content:
             bot_turn = room_history.create_bot_turn(speaker, clean_content)
             added = room_history.add_turn(bot_turn)
             if added and ctx.room and getattr(ctx.room, "local_participant", None):
+                async def _safe_publish_bot(payload_bytes: bytes):
+                    try:
+                        await ctx.room.local_participant.publish_data(payload_bytes, topic="room_context", reliable=True)
+                    except Exception as pub_err:
+                        clean_err = sanitize_log_message(str(pub_err))
+                        logger.warning(f"[ROOM] event=context_sync_error error='{clean_err}'")
+
                 try:
                     payload = room_history.serialize_turn_event(bot_turn)
-                    asyncio.create_task(ctx.room.local_participant.publish_data(payload, topic="room_context", reliable=True))
+                    asyncio.create_task(_safe_publish_bot(payload))
                 except Exception as pub_err:
-                    logger.warning(f"[RoomHistory] Failed to publish bot turn DataChannel event: {pub_err}")
+                    clean_err = sanitize_log_message(str(pub_err))
+                    logger.warning(f"[ROOM] event=context_sync_error error='{clean_err}'")
 
     # 7. Text Chat Handling & Room Context Synchronization over DataChannel
     async def handle_text_chat_response(text: str, wait_for_dost: bool = False):
@@ -460,14 +582,30 @@ async def entrypoint(ctx: JobContext):
                     payload = room_history.serialize_turn_event(human_turn)
                     await ctx.room.local_participant.publish_data(payload, topic="room_context", reliable=True)
                 except Exception as pub_err:
-                    logger.warning(f"[RoomHistory] Text chat human turn publish error: {pub_err}")
+                    clean_err = sanitize_log_message(str(pub_err))
+                    logger.warning(f"[ROOM] event=context_sync_error error='{clean_err}'")
 
             c_ctx = room_history.build_chat_context(SYSTEM_PROMPT, is_sathi=IS_SATHI)
-            stream = agent.llm.chat(chat_ctx=c_ctx)
             reply_text = ""
-            async for chunk in stream:
-                if chunk.choices and chunk.choices[0].delta.content:
-                    reply_text += chunk.choices[0].delta.content
+            try:
+                stream = agent.llm.chat(chat_ctx=c_ctx)
+                async for chunk in stream:
+                    if chunk.choices and chunk.choices[0].delta.content:
+                        reply_text += chunk.choices[0].delta.content
+                if not reply_text:
+                    reply_text = (
+                        "Thoda technical issue aa gaya. Ek baar phir poochho."
+                        if not IS_SATHI
+                        else "Kuch technical problem aa gayi hai. Kripya ek baar phir poochhiye."
+                    )
+            except Exception as llm_err:
+                clean_err = sanitize_log_message(str(llm_err))
+                logger.error(f"[LLM] bot={DISPLAY_NAME} event=provider_error error='{clean_err}'")
+                reply_text = (
+                    "Thoda technical issue aa gaya. Ek baar phir poochho."
+                    if not IS_SATHI
+                    else "Kuch technical problem aa gayi hai. Kripya ek baar phir poochhiye."
+                )
 
             if reply_text:
                 clean_reply = strip_speaker_labels(reply_text)
@@ -479,7 +617,8 @@ async def entrypoint(ctx: JobContext):
                         payload = room_history.serialize_turn_event(bot_turn)
                         await ctx.room.local_participant.publish_data(payload, topic="room_context", reliable=True)
                     except Exception as pub_err:
-                        logger.warning(f"[RoomHistory] Text chat bot turn publish error: {pub_err}")
+                        clean_err = sanitize_log_message(str(pub_err))
+                        logger.warning(f"[ROOM] event=context_sync_error error='{clean_err}'")
 
                 chat_msg = {
                     "id": str(int(time.time() * 1000)),
@@ -493,7 +632,8 @@ async def entrypoint(ctx: JobContext):
                 await ctx.room.local_participant.publish_data(payload, topic="chat", reliable=True)
                 await agent.say(clean_reply, allow_interruptions=True)
         except Exception as err:
-            logger.error(f"[{DISPLAY_NAME}] Text chat response generation error: {err}")
+            clean_err = sanitize_log_message(str(err))
+            logger.error(f"[{DISPLAY_NAME}] Text chat response generation error: {clean_err}")
 
     @ctx.room.on("data_received")
     def on_data_received(dp: rtc.DataPacket):
@@ -532,7 +672,28 @@ async def entrypoint(ctx: JobContext):
             elif IS_SATHI and selected_agent in ("sathi", "both"):
                 asyncio.create_task(handle_text_chat_response(text, wait_for_dost=(selected_agent == "both")))
         except Exception as e:
-            logger.error(f"[{DISPLAY_NAME} DataChannel Error]: {e}")
+            clean_err = sanitize_log_message(str(e))
+            logger.error(f"[{DISPLAY_NAME} DataChannel Error]: {clean_err}")
+
+    # Participant Connection & Disconnection Event Listeners
+    @ctx.room.on("participant_connected")
+    def _on_room_participant_connected(p: rtc.RemoteParticipant):
+        nonlocal human_participant
+        logger.info(f"[CONNECTION] event=participant_connected identity='{p.identity}'")
+        if is_human_participant(p):
+            logger.info(f"[CONNECTION] Human participant joined: '{p.identity}'")
+            human_participant = p
+            if not getattr(agent, "_started", False):
+                agent.start(ctx.room, participant=human_participant)
+
+    @ctx.room.on("participant_disconnected")
+    def _on_room_participant_disconnected(p: rtc.RemoteParticipant):
+        nonlocal human_participant
+        logger.info(f"[CONNECTION] event=participant_disconnected identity='{p.identity}'")
+        if human_participant and human_participant.identity == p.identity:
+            logger.info(f"[CONNECTION] Human participant '{p.identity}' left room.")
+            human_participant = None
+            agent.interrupt(interrupt_all=True)
 
     # 8. Start VoicePipelineAgent linked exclusively to human participant
     if human_participant is not None:
@@ -542,14 +703,14 @@ async def entrypoint(ctx: JobContext):
         logger.info(f"[{DISPLAY_NAME}] No human in room yet. Standing by for human participant to connect...")
         connected_event = asyncio.Event()
 
-        def _on_participant_connected(p: rtc.RemoteParticipant):
+        def _on_participant_connected_init(p: rtc.RemoteParticipant):
             nonlocal human_participant
             if is_human_participant(p) and not connected_event.is_set():
                 logger.info(f"[{DISPLAY_NAME}] LINKING AUDIO TRACK: human participant connected target_identity='{p.identity}', name='{p.name}', kind='{p.kind}'")
                 human_participant = p
                 connected_event.set()
 
-        ctx.room.on("participant_connected", _on_participant_connected)
+        ctx.room.on("participant_connected", _on_participant_connected_init)
         await connected_event.wait()
         agent.start(ctx.room, participant=human_participant)
 
@@ -566,7 +727,8 @@ async def entrypoint(ctx: JobContext):
             )
             logger.info(f"[{DISPLAY_NAME}] Greeting published successfully.")
         except Exception as say_err:
-            logger.error(f"[{DISPLAY_NAME} Error] Failed to speak greeting: {say_err}")
+            clean_err = sanitize_log_message(str(say_err))
+            logger.error(f"[{DISPLAY_NAME} Error] Failed to speak greeting: {clean_err}")
     else:
         logger.info(f"[{DISPLAY_NAME}] Sathi connected. Automatic startup greeting disabled (standing by for user turns).")
 
