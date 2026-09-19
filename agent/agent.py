@@ -34,6 +34,14 @@ from openai import AsyncOpenAI
 import openai as openai_sdk
 from edge_tts_wrapper import EdgeTTS
 from router import route_turn
+from room_context import (
+    RoomHistoryManager,
+    RoomTurn,
+    SPEAKER_HUMAN,
+    SPEAKER_DOST,
+    SPEAKER_SATHI,
+    strip_speaker_labels,
+)
 
 # Absolute path resolution for dotenv loading
 agent_dir = os.path.dirname(os.path.abspath(__file__))
@@ -114,6 +122,13 @@ COMMUNICATION & LANGUAGE STYLE RULES:
 6. Naturally mix technical English terms (technology, decision, room, mic, network, server, cloud, example, smart) inside Hindi sentences.
 7. Be polite, friendly, and helpful like a great friend (Dost).
 8. Do not introduce yourself unnecessarily on every response.
+
+ROOM CONTEXT & MULTI-AGENT AWARENESS:
+- You are participating in a LiveKit room with human participants and another AI assistant ('Roxstar AI Sathi').
+- The conversation history contains previous turns from human participants, Dost, and Sathi labeled as [Human], [Roxstar AI Dost], and [Roxstar AI Sathi].
+- Use this shared history to understand references (e.g. "iska", "that", "previous topic") and facts mentioned by any speaker.
+- Do not speak or repeat internal speaker labels such as [Human], [Roxstar AI Dost], or [Roxstar AI Sathi]. These labels are metadata used only for conversation context.
+- Respond naturally as your own persona without prefixing your output with your name or any speaker tag.
 """
 
 # Roxstar AI Sathi Persona System Prompt
@@ -132,6 +147,13 @@ COMMUNICATION & LANGUAGE STYLE RULES:
 6. Naturally mix technical English terms (computing, cloud, data, algorithm, model, example, machine) inside Hindi sentences.
 7. Be encouraging, empathetic, warm, and helpful (Sathi / companion persona), distinct from Dost.
 8. Do not introduce yourself unnecessarily on every response.
+
+ROOM CONTEXT & MULTI-AGENT AWARENESS:
+- You are participating in a LiveKit room with human participants and another AI assistant ('Roxstar AI Dost').
+- The conversation history contains previous turns from human participants, Dost, and Sathi labeled as [Human], [Roxstar AI Dost], and [Roxstar AI Sathi].
+- Use this shared history to understand references (e.g. "iska", "that", "previous topic") and facts mentioned by any speaker.
+- Do not speak or repeat internal speaker labels such as [Human], [Roxstar AI Dost], or [Roxstar AI Sathi]. These labels are metadata used only for conversation context.
+- Respond naturally as your own persona without prefixing your output with your name or any speaker tag.
 """
 
 SYSTEM_PROMPT = SATHI_SYSTEM_PROMPT if IS_SATHI else DOST_SYSTEM_PROMPT
@@ -155,6 +177,25 @@ def is_human_participant(p: rtc.RemoteParticipant) -> bool:
         
     return True
 
+async def _strip_async_stream(stream: AsyncIterable[str]) -> AsyncIterable[str]:
+    """Helper to strip internal speaker labels from streaming LLM output before TTS."""
+    first_buffer = ""
+    stripped = False
+    async for chunk in stream:
+        if not stripped:
+            first_buffer += chunk
+            if ":" in first_buffer or len(first_buffer) > 40:
+                cleaned = strip_speaker_labels(first_buffer)
+                stripped = True
+                if cleaned:
+                    yield cleaned
+        else:
+            yield chunk
+    if not stripped and first_buffer:
+        cleaned = strip_speaker_labels(first_buffer)
+        if cleaned:
+            yield cleaned
+
 # Speech session turn owner lock to prevent split STT chunks from shifting turn ownership mid-speech
 def before_tts_cb(agent_inst: VoicePipelineAgent | None, text: str | AsyncIterable[str], is_sathi: bool | None = None):
     if is_sathi is None:
@@ -175,9 +216,20 @@ def before_tts_cb(agent_inst: VoicePipelineAgent | None, text: str | AsyncIterab
 
     logger.info(f"[BotLifecycle] bot={bot_name} event=llm_finished")
     logger.info(f"[BotLifecycle] bot={bot_name} event=tts_started")
+
+    if isinstance(text, str):
+        return strip_speaker_labels(text)
+    elif isinstance(text, AsyncIterable):
+        return _strip_async_stream(text)
     return text
 
-async def before_llm_cb(agent_inst: VoicePipelineAgent | None, chat_ctx: llm.ChatContext, is_sathi: bool | None = None, room: rtc.Room | None = None):
+async def before_llm_cb(
+    agent_inst: VoicePipelineAgent | None,
+    chat_ctx: llm.ChatContext,
+    is_sathi: bool | None = None,
+    room: rtc.Room | None = None,
+    room_history: RoomHistoryManager | None = None,
+):
     if is_sathi is None:
         is_sathi = IS_SATHI
     bot_name = "Sathi" if is_sathi else "Dost"
@@ -229,6 +281,22 @@ async def before_llm_cb(agent_inst: VoicePipelineAgent | None, chat_ctx: llm.Cha
     logger.info(f"[TurnDebug] bot={bot_name} task={task_id} result=allowed")
     logger.info(f"[BotLifecycle] bot={bot_name} event=before_llm decision=allowed")
 
+    # Phase 4: Shared Room History Context Injection for Selected Agent
+    if room_history is not None:
+        human_turn = room_history.create_human_turn(user_input_clean)
+        added = room_history.add_turn(human_turn)
+        if added and room and hasattr(room, "local_participant") and room.local_participant:
+            try:
+                payload = room_history.serialize_turn_event(human_turn)
+                asyncio.create_task(room.local_participant.publish_data(payload, topic="room_context", reliable=True))
+            except Exception as pub_err:
+                logger.warning(f"[RoomHistory] Failed to publish human turn DataChannel event: {pub_err}")
+
+        sys_prompt = SATHI_SYSTEM_PROMPT if is_sathi else DOST_SYSTEM_PROMPT
+        new_ctx = room_history.build_chat_context(sys_prompt, is_sathi=is_sathi)
+        chat_ctx.messages.clear()
+        chat_ctx.messages.extend(new_ctx.messages)
+
     if is_sathi and selected_agent == "both":
         logger.info(f"[{bot_name}] [Turn Lifecycle] both requested. Sathi waiting for Dost to complete turn...")
         await asyncio.sleep(3.5)
@@ -239,6 +307,9 @@ async def before_llm_cb(agent_inst: VoicePipelineAgent | None, chat_ctx: llm.Cha
 
 async def entrypoint(ctx: JobContext):
     logger.info(f"[{DISPLAY_NAME}] Job received for room: {ctx.room.name}")
+    
+    # Initialize Phase 4 RoomHistoryManager for this room session
+    room_history = RoomHistoryManager(max_turns=20)
 
     # 1. OpenRouter Credentials Verification (LLM)
     openrouter_key = os.getenv("OPENROUTER_API_KEY")
@@ -320,7 +391,7 @@ async def entrypoint(ctx: JobContext):
 
     # 6. Deterministic Voice Turn Routing Callbacks
     async def _before_llm(agent_inst: VoicePipelineAgent, chat_ctx: llm.ChatContext):
-        return await before_llm_cb(agent_inst, chat_ctx, is_sathi=IS_SATHI, room=ctx.room)
+        return await before_llm_cb(agent_inst, chat_ctx, is_sathi=IS_SATHI, room=ctx.room, room_history=room_history)
 
     def _before_tts(agent_inst: VoicePipelineAgent, text: str | AsyncIterable[str]):
         return before_tts_cb(agent_inst, text, is_sathi=IS_SATHI)
@@ -362,15 +433,36 @@ async def entrypoint(ctx: JobContext):
     @agent.on("agent_speech_committed")
     def _on_agent_speech_committed(msg):
         bot_name = "Sathi" if IS_SATHI else "Dost"
-        logger.info(f"[{AGENT_NAME}] [Turn Lifecycle] LLM generation completed: '{msg.content}'")
+        speaker = SPEAKER_SATHI if IS_SATHI else SPEAKER_DOST
+        clean_content = strip_speaker_labels(msg.content or "")
+        logger.info(f"[{AGENT_NAME}] [Turn Lifecycle] LLM generation completed: '{clean_content}'")
 
-    # 7. Text Chat Handling over DataChannel
+        if clean_content:
+            bot_turn = room_history.create_bot_turn(speaker, clean_content)
+            added = room_history.add_turn(bot_turn)
+            if added and ctx.room and getattr(ctx.room, "local_participant", None):
+                try:
+                    payload = room_history.serialize_turn_event(bot_turn)
+                    asyncio.create_task(ctx.room.local_participant.publish_data(payload, topic="room_context", reliable=True))
+                except Exception as pub_err:
+                    logger.warning(f"[RoomHistory] Failed to publish bot turn DataChannel event: {pub_err}")
+
+    # 7. Text Chat Handling & Room Context Synchronization over DataChannel
     async def handle_text_chat_response(text: str, wait_for_dost: bool = False):
         if wait_for_dost:
             await asyncio.sleep(2.5)
         try:
-            c_ctx = agent.chat_ctx.copy()
-            c_ctx.messages.append(llm.ChatMessage.create(text=text, role="user"))
+            clean_text = strip_speaker_labels(text)
+            human_turn = room_history.create_human_turn(clean_text)
+            added = room_history.add_turn(human_turn)
+            if added and ctx.room and getattr(ctx.room, "local_participant", None):
+                try:
+                    payload = room_history.serialize_turn_event(human_turn)
+                    await ctx.room.local_participant.publish_data(payload, topic="room_context", reliable=True)
+                except Exception as pub_err:
+                    logger.warning(f"[RoomHistory] Text chat human turn publish error: {pub_err}")
+
+            c_ctx = room_history.build_chat_context(SYSTEM_PROMPT, is_sathi=IS_SATHI)
             stream = agent.llm.chat(chat_ctx=c_ctx)
             reply_text = ""
             async for chunk in stream:
@@ -378,17 +470,28 @@ async def entrypoint(ctx: JobContext):
                     reply_text += chunk.choices[0].delta.content
 
             if reply_text:
+                clean_reply = strip_speaker_labels(reply_text)
+                speaker = SPEAKER_SATHI if IS_SATHI else SPEAKER_DOST
+                bot_turn = room_history.create_bot_turn(speaker, clean_reply)
+                b_added = room_history.add_turn(bot_turn)
+                if b_added and ctx.room and getattr(ctx.room, "local_participant", None):
+                    try:
+                        payload = room_history.serialize_turn_event(bot_turn)
+                        await ctx.room.local_participant.publish_data(payload, topic="room_context", reliable=True)
+                    except Exception as pub_err:
+                        logger.warning(f"[RoomHistory] Text chat bot turn publish error: {pub_err}")
+
                 chat_msg = {
                     "id": str(int(time.time() * 1000)),
                     "sender": DISPLAY_NAME,
-                    "text": reply_text,
+                    "text": clean_reply,
                     "timestamp": time.strftime("%I:%M %p"),
                     "isBot": True,
                     "botType": BOT_KEY,
                 }
                 payload = json.dumps(chat_msg).encode("utf-8")
                 await ctx.room.local_participant.publish_data(payload, topic="chat", reliable=True)
-                await agent.say(reply_text, allow_interruptions=True)
+                await agent.say(clean_reply, allow_interruptions=True)
         except Exception as err:
             logger.error(f"[{DISPLAY_NAME}] Text chat response generation error: {err}")
 
@@ -396,8 +499,18 @@ async def entrypoint(ctx: JobContext):
     def on_data_received(dp: rtc.DataPacket):
         try:
             topic = getattr(dp, "topic", "")
+
+            # Topic "room_context": Room history turn synchronization across processes
+            if topic == "room_context":
+                turn = room_history.deserialize_turn_event(dp.data)
+                if turn:
+                    room_history.add_turn(turn)
+                return
+
             if topic and topic != "chat":
                 return
+
+            # Topic "chat": Text chat messages from user / frontend
             raw_str = dp.data.decode("utf-8")
             data = json.loads(raw_str)
             sender = data.get("sender", "")
@@ -478,3 +591,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
