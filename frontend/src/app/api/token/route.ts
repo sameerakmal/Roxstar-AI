@@ -51,16 +51,19 @@ export async function GET(req: NextRequest) {
       canPublishData: true,
     });
 
-    // Embed agent dispatch configuration for 'roxstar-ai-dost'
+    // Embed agent dispatch configuration for 'roxstar-ai-dost' and 'roxstar-ai-sathi'
     at.roomConfig = new RoomConfiguration({
       agents: [
         new RoomAgentDispatch({
           agentName: "roxstar-ai-dost",
         }),
+        new RoomAgentDispatch({
+          agentName: "roxstar-ai-sathi",
+        }),
       ],
     });
 
-    console.log(`[Agent Dispatch] Added roxstar-ai-dost to room configuration for room: ${room}`);
+    console.log(`[Agent Dispatch] Added roxstar-ai-dost and roxstar-ai-sathi to room configuration for room: ${room}`);
 
     const token = await at.toJwt();
     return NextResponse.json({ token, room, username, serverUrl });
@@ -105,16 +108,19 @@ export async function POST(req: NextRequest) {
       canPublishData: true,
     });
 
-    // Embed agent dispatch configuration for 'roxstar-ai-dost'
+    // Embed agent dispatch configuration for 'roxstar-ai-dost' and 'roxstar-ai-sathi'
     at.roomConfig = new RoomConfiguration({
       agents: [
         new RoomAgentDispatch({
           agentName: "roxstar-ai-dost",
         }),
+        new RoomAgentDispatch({
+          agentName: "roxstar-ai-sathi",
+        }),
       ],
     });
 
-    console.log(`[Agent Dispatch] Added roxstar-ai-dost to room configuration for room: ${room}`);
+    console.log(`[Agent Dispatch] Added roxstar-ai-dost and roxstar-ai-sathi to room configuration for room: ${room}`);
 
     const token = await at.toJwt();
     return NextResponse.json({ token, room, username, serverUrl });

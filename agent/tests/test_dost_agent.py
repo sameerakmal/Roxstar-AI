@@ -2,13 +2,19 @@ import sys
 import os
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 import pytest
-from agent import DOST_SYSTEM_PROMPT
+from agent import DOST_SYSTEM_PROMPT, SATHI_SYSTEM_PROMPT, GracefulGroqSTT
 
 def test_dost_system_prompt_rules():
     assert "Roxstar AI Dost" in DOST_SYSTEM_PROMPT
     assert "Hinglish" in DOST_SYSTEM_PROMPT
     assert "Roman script" in DOST_SYSTEM_PROMPT
     assert "technology" in DOST_SYSTEM_PROMPT
+
+def test_sathi_system_prompt_rules():
+    assert "Roxstar AI Sathi" in SATHI_SYSTEM_PROMPT
+    assert "Hinglish" in SATHI_SYSTEM_PROMPT
+    assert "Roman script" in SATHI_SYSTEM_PROMPT
+    assert "computing" in SATHI_SYSTEM_PROMPT
 
 def test_should_respond_relevance():
     def should_respond(text: str) -> bool:
@@ -45,3 +51,22 @@ def test_openrouter_llm_max_tokens_configured():
 
     assert "max_tokens=500" in content
     assert "temperature=0.7" in content
+
+@pytest.mark.anyio
+async def test_graceful_groq_stt_rate_limit_handling(monkeypatch):
+    import openai as openai_sdk
+    stt = GracefulGroqSTT(api_key="gsk_dummy")
+
+    async def mock_recognize(*args, **kwargs):
+        raise openai_sdk.RateLimitError(
+            message="Rate limit reached for model whisper-large-v3. Please try again in 3.5s.",
+            response=None,
+            body=None,
+        )
+
+    monkeypatch.setattr("livekit.plugins.groq.STT._recognize_impl", mock_recognize)
+
+    res = await stt._recognize_impl(None, language=None, conn_options=None)
+    assert res is not None
+    assert res.type.name == "FINAL_TRANSCRIPT"
+    assert res.alternatives[0].text == ""
