@@ -16,6 +16,7 @@ dist/
 venv/
 .venv/
 env/
+agent/venv/
 __pycache__/
 *.pyc
 *.pyo
@@ -31,3 +32,5 @@ __pycache__/
 .DS_Store
 Thumbs.db
 
+
+*.pdf

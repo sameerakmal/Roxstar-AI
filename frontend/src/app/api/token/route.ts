@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import { AccessToken } from "livekit-server-sdk";
+import { AccessToken, RoomAgentDispatch, RoomConfiguration } from "livekit-server-sdk";
 
 function sanitizeEnvVar(val?: string): string {
   if (!val) return "";
@@ -36,6 +36,7 @@ export async function GET(req: NextRequest) {
   }
 
   try {
+    // Generate participant token with embedded room agent dispatch configuration
     const at = new AccessToken(apiKey, apiSecret, {
       identity: username,
       name: username,
@@ -49,6 +50,17 @@ export async function GET(req: NextRequest) {
       canSubscribe: true,
       canPublishData: true,
     });
+
+    // Embed agent dispatch configuration for 'roxstar-ai-dost'
+    at.roomConfig = new RoomConfiguration({
+      agents: [
+        new RoomAgentDispatch({
+          agentName: "roxstar-ai-dost",
+        }),
+      ],
+    });
+
+    console.log(`[Agent Dispatch] Added roxstar-ai-dost to room configuration for room: ${room}`);
 
     const token = await at.toJwt();
     return NextResponse.json({ token, room, username, serverUrl });
@@ -92,6 +104,17 @@ export async function POST(req: NextRequest) {
       canSubscribe: true,
       canPublishData: true,
     });
+
+    // Embed agent dispatch configuration for 'roxstar-ai-dost'
+    at.roomConfig = new RoomConfiguration({
+      agents: [
+        new RoomAgentDispatch({
+          agentName: "roxstar-ai-dost",
+        }),
+      ],
+    });
+
+    console.log(`[Agent Dispatch] Added roxstar-ai-dost to room configuration for room: ${room}`);
 
     const token = await at.toJwt();
     return NextResponse.json({ token, room, username, serverUrl });
