@@ -112,18 +112,18 @@ sequenceDiagram
     participant LK as LiveKit Room
     participant Dost as Dost Worker (Order 1)
     participant Sathi as Sathi Worker (Order 2)
-    participant DC as DataChannel ('bot_orchestration')
+    participant DC as DataChannel (bot_orchestration)
 
     Human->>LK: "AI Dost, tum answer karo. AI Sathi, baad mein example dena."
     Note over Dost,Sathi: Both workers parse identical MultiBotPlan (Dost=1, Sathi=2)
-    Dost->>Dost: Order 1 proceeds immediately to LLM + TTS
+    Dost->>Dost: Order 1 proceeds immediately to LLM and TTS
     Sathi->>Sathi: Order 2 registers pending plan, suppresses immediate turn
     Dost-->>LK: Dost speaks answer to user
-    Note over Dost: Agent speech committed & completed
-    Dost->>DC: Publish 'bot_turn_complete' (order=1, content="...")
-    DC->>Sathi: Receive 'bot_turn_complete'
-    Note over Sathi: Release Order 2; inject Dost's response into context
-    Sathi->>Sathi: Generate targeted follow-up building on Dost's explanation
+    Note over Dost: Agent speech committed and completed
+    Dost->>DC: Publish bot_turn_complete (order=1)
+    DC->>Sathi: Receive bot_turn_complete
+    Note over Sathi: Release Order 2 and inject Dost response into context
+    Sathi->>Sathi: Generate targeted follow-up building on Dost explanation
     Sathi-->>LK: Sathi speaks example to user
 ```
 
