@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useState } from "react";
+import React, { useState, useRef, useEffect } from "react";
 import {
   LiveKitRoom,
   RoomAudioRenderer,
@@ -9,7 +9,16 @@ import {
   useDataChannel,
   useLocalParticipant,
 } from "@livekit/components-react";
-import { Mic, MicOff, PhoneOff, MessageSquare, Send, Bot, User, Radio, AlertCircle } from "lucide-react";
+import {
+  Mic,
+  MicOff,
+  PhoneOff,
+  MessageSquare,
+  Send,
+  Radio,
+  AlertCircle,
+  MessageCircle,
+} from "lucide-react";
 
 interface ChatMessage {
   id: string;
@@ -68,72 +77,103 @@ export default function Home() {
     setJoined(false);
   };
 
+  /* ──────────────────────────────────────
+     Join Screen
+     ────────────────────────────────────── */
   if (!joined || !token || !serverUrl) {
     return (
       <main className="join-container">
-        <div className="join-card glass-panel">
-          <div className="logo-badge">
-            <Radio size={28} /> Roxstar AI Voice Room
+        <div className="join-card">
+          {/* Brand */}
+          <div className="join-brand">
+            <div className="join-brand-icon">
+              <Radio size={18} />
+            </div>
+            <div className="join-brand-text">
+              <span>Rox</span>Star
+            </div>
           </div>
-          <p className="sub-title">Real-Time Indian AI Assistants: Dost & Sathi</p>
 
-          <form onSubmit={handleJoin}>
-            <div className="input-group">
-              <label className="input-label" htmlFor="username-input">Your Name</label>
-              <input
-                id="username-input"
-                type="text"
-                className="styled-input"
-                placeholder="e.g. Rahul or Priya"
-                value={username}
-                onChange={(e) => setUsername(e.target.value)}
-                required
-              />
-            </div>
+          {/* Tagline */}
+          <p className="join-tagline">
+            Talk naturally.<br />
+            Your AI companions are listening.
+          </p>
+          <p className="join-description">
+            Join a live voice room with Dost and Sathi — friendly AI companions who
+            understand Hindi and English.
+          </p>
 
-            <div className="input-group">
-              <label className="input-label" htmlFor="room-input">Room Name</label>
-              <input
-                id="room-input"
-                type="text"
-                className="styled-input"
-                placeholder="roxstar-voice-room"
-                value={roomName}
-                onChange={(e) => setRoomName(e.target.value)}
-                required
-              />
-            </div>
-
-            {error && (
-              <div
-                style={{
-                  background: "rgba(239, 68, 68, 0.15)",
-                  border: "1px solid rgba(239, 68, 68, 0.4)",
-                  color: "#fca5a5",
-                  padding: "10px 14px",
-                  borderRadius: "8px",
-                  fontSize: "0.85rem",
-                  marginBottom: "16px",
-                  display: "flex",
-                  alignItems: "center",
-                  gap: "8px",
-                  textAlign: "left",
-                }}
-              >
-                <AlertCircle size={18} style={{ flexShrink: 0 }} />
-                <span>{error}</span>
+          {/* Form */}
+          <div className="join-form-section">
+            <form onSubmit={handleJoin}>
+              <div className="input-group">
+                <label className="input-label" htmlFor="username-input">
+                  Your name
+                </label>
+                <input
+                  id="username-input"
+                  type="text"
+                  className="styled-input"
+                  placeholder="e.g. Rahul or Priya"
+                  value={username}
+                  onChange={(e) => setUsername(e.target.value)}
+                  required
+                />
               </div>
-            )}
 
-            <button id="join-room-btn" type="submit" className="join-btn" disabled={loading}>
-              {loading ? "Connecting..." : "Join Voice Room"}
-            </button>
-          </form>
+              <div className="input-group">
+                <label className="input-label" htmlFor="room-input">
+                  Room name
+                </label>
+                <input
+                  id="room-input"
+                  type="text"
+                  className="styled-input"
+                  placeholder="roxstar-voice-room"
+                  value={roomName}
+                  onChange={(e) => setRoomName(e.target.value)}
+                  required
+                />
+              </div>
+
+              {error && (
+                <div className="join-error">
+                  <AlertCircle size={16} />
+                  <span>{error}</span>
+                </div>
+              )}
+
+              <button
+                id="join-room-btn"
+                type="submit"
+                className="join-btn"
+                disabled={loading}
+              >
+                {loading ? "Connecting…" : "Join Voice Room"}
+              </button>
+            </form>
+          </div>
+
+          {/* Companion preview */}
+          <div className="companion-preview">
+            <div className="companion-pill">
+              <div className="companion-pill-avatar dost">D</div>
+              Dost
+            </div>
+            <div className="companion-pill">
+              <div className="companion-pill-avatar sathi">S</div>
+              Sathi
+            </div>
+          </div>
         </div>
       </main>
     );
   }
 
+  /* ──────────────────────────────────────
+     Room
+     ────────────────────────────────────── */
   return (
     <LiveKitRoom
       video={false}
@@ -166,12 +206,27 @@ export default function Home() {
   );
 }
 
-function RoomContent({ roomName, username, onLeave }: { roomName: string; username: string; onLeave: () => void }) {
+
+/* ================================================================
+   Room Content
+   ================================================================ */
+
+function RoomContent({
+  roomName,
+  username,
+  onLeave,
+}: {
+  roomName: string;
+  username: string;
+  onLeave: () => void;
+}) {
   const room = useRoomContext();
   const participants = useParticipants();
   const { localParticipant } = useLocalParticipant();
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [inputMsg, setInputMsg] = useState("");
+  const [chatOpen, setChatOpen] = useState(false);
+  const chatEndRef = useRef<HTMLDivElement>(null);
 
   const { send } = useDataChannel("chat", (msg) => {
     try {
@@ -182,6 +237,11 @@ function RoomContent({ roomName, username, onLeave }: { roomName: string; userna
       console.error("Failed to decode chat message:", e);
     }
   });
+
+  // Auto-scroll chat
+  useEffect(() => {
+    chatEndRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [messages]);
 
   const isMuted = !localParticipant.isMicrophoneEnabled;
 
@@ -201,7 +261,10 @@ function RoomContent({ roomName, username, onLeave }: { roomName: string; userna
       id: Math.random().toString(36).substring(7),
       sender: username,
       text: inputMsg,
-      timestamp: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
+      timestamp: new Date().toLocaleTimeString([], {
+        hour: "2-digit",
+        minute: "2-digit",
+      }),
     };
 
     const encoder = new TextEncoder();
@@ -212,99 +275,185 @@ function RoomContent({ roomName, username, onLeave }: { roomName: string; userna
     setInputMsg("");
   };
 
+  /** Get initial letter for avatar */
+  const getInitial = (name: string) => {
+    return (name || "?").charAt(0).toUpperCase();
+  };
+
   return (
     <div className="room-layout">
-      {/* Left Stage */}
+      {/* ── Header ── */}
+      <header className="room-header">
+        <div className="room-header-brand">
+          <Radio size={18} />
+          <span className="room-brand-text">
+            <span>Rox</span>Star
+          </span>
+        </div>
+
+        <div className="room-header-center desktop-only">
+          <span className="room-name-text">{roomName}</span>
+        </div>
+
+        <div className="room-header-right">
+          <div className="room-header-live">
+            <span className="pulse-dot" />
+            Live
+          </div>
+          <div className="room-header-count">
+            {participants.length} participant{participants.length !== 1 ? "s" : ""}
+          </div>
+        </div>
+      </header>
+
+      {/* ── Participant Stage ── */}
       <div className="main-stage">
-        {/* Header */}
-        <div className="header-bar glass-panel">
-          <div className="room-info">
-            <h2 style={{ fontSize: "1.2rem", fontWeight: 700 }}>Roxstar Voice Assistant Room</h2>
-            <span className="room-badge">Room: {roomName}</span>
-          </div>
-          <div className="status-indicator">
-            <span className="pulse-dot"></span> Live ({participants.length} Active)
+        <div className="participant-stage">
+          <div className="participant-grid">
+            {participants.map((p) => {
+              const name = p.name || p.identity;
+              const isDost = name.toLowerCase().includes("dost");
+              const isSathi = name.toLowerCase().includes("sathi");
+              const isBot = isDost || isSathi;
+              const isSpeaking = p.isSpeaking;
+
+              let avatarClass = "participant-avatar human";
+              if (isDost) avatarClass = "participant-avatar dost";
+              if (isSathi) avatarClass = "participant-avatar sathi";
+
+              let spotClass = "participant-spot";
+              if (isSpeaking) spotClass += " speaking";
+
+              const initial = isDost ? "D" : isSathi ? "S" : getInitial(name);
+              const role = isDost
+                ? "AI Companion"
+                : isSathi
+                ? "AI Companion"
+                : "Participant";
+
+              return (
+                <div key={p.sid || p.identity} className={spotClass}>
+                  {/* Avatar */}
+                  <div className={avatarClass}>
+                    {initial}
+                    {!p.isMicrophoneEnabled && (
+                      <div className="participant-muted-badge">
+                        <MicOff size={11} />
+                      </div>
+                    )}
+                  </div>
+
+                  {/* Name */}
+                  <div className="participant-name">{name}</div>
+
+                  {/* Role */}
+                  <div className="participant-role">{role}</div>
+
+                  {/* Speaking label */}
+                  <div
+                    className={`participant-speaking-label${
+                      isSathi ? " sathi-label" : ""
+                    }`}
+                  >
+                    {isSpeaking ? "Speaking" : "\u00A0"}
+                  </div>
+                </div>
+              );
+            })}
           </div>
         </div>
 
-        {/* Participants Grid */}
-        <div className="participant-grid">
-          {participants.map((p) => {
-            const name = p.name || p.identity;
-            const isDost = name.toLowerCase().includes("dost");
-            const isSathi = name.toLowerCase().includes("sathi");
-            const isBot = isDost || isSathi;
-            const isSpeaking = p.isSpeaking;
-
-            let cardClass = "participant-card glass-panel human";
-            if (isDost) cardClass = "participant-card glass-panel dost";
-            if (isSathi) cardClass = "participant-card glass-panel sathi";
-            if (isSpeaking) cardClass += " speaking";
-
-            return (
-              <div key={p.sid || p.identity} className={cardClass}>
-                <div className="avatar-wrapper">
-                  {isBot ? <Bot size={32} /> : <User size={32} />}
-                </div>
-                <div className="participant-name">{name}</div>
-                <div className="participant-tag">
-                  {isDost ? "Roxstar AI Dost (Male Bot)" : isSathi ? "Roxstar AI Sathi (Female Bot)" : "Human Participant"}
-                </div>
-                <div className="mic-badge">
-                  {p.isMicrophoneEnabled ? (
-                    <Mic size={14} color={isSpeaking ? "#4ade80" : "#94a3b8"} />
-                  ) : (
-                    <MicOff size={14} color="#ef4444" />
-                  )}
-                </div>
-              </div>
-            );
-          })}
-        </div>
-
-        {/* Controls Bar */}
-        <div className="controls-bar glass-panel">
+        {/* ── Controls ── */}
+        <div className="controls-bar">
           <button
-            id="mic-toggle-btn"
-            className={`control-btn ${isMuted ? "" : "active"}`}
-            onClick={toggleMic}
+            className={`control-btn chat-toggle-btn mobile-only`}
+            onClick={() => setChatOpen((v) => !v)}
+            aria-label="Toggle chat"
           >
-            {isMuted ? <MicOff size={18} /> : <Mic size={18} />}
-            {isMuted ? "Unmute Mic" : "Mute Mic"}
+            <MessageSquare size={16} />
           </button>
 
-          <button id="leave-room-btn" className="control-btn danger" onClick={onLeave}>
-            <PhoneOff size={18} /> Leave Room
+          <button
+            id="mic-toggle-btn"
+            className={`mic-btn ${isMuted ? "mic-off" : "mic-on"}`}
+            onClick={toggleMic}
+            aria-label={isMuted ? "Unmute microphone" : "Mute microphone"}
+          >
+            {isMuted ? <MicOff size={20} /> : <Mic size={20} />}
+          </button>
+
+          <button
+            id="leave-room-btn"
+            className="control-btn leave-btn"
+            onClick={onLeave}
+          >
+            <PhoneOff size={15} />
+            Leave
           </button>
         </div>
       </div>
 
-      {/* Right Chat Sidebar */}
-      <div className="chat-sidebar glass-panel">
+      {/* ── Chat backdrop (mobile) ── */}
+      <div
+        className={`chat-overlay-backdrop${chatOpen ? " chat-visible" : ""}`}
+        onClick={() => setChatOpen(false)}
+      />
+
+      {/* ── Chat Sidebar ── */}
+      <aside
+        className={`chat-sidebar${chatOpen ? " chat-visible" : ""}`}
+      >
         <div className="chat-header">
-          <MessageSquare size={18} /> Room Text Chat
+          <MessageCircle size={16} />
+          Chat
         </div>
 
         <div className="chat-messages">
           {messages.length === 0 ? (
-            <div style={{ color: "var(--text-secondary)", fontSize: "0.85rem", textAlign: "center", marginTop: "40px" }}>
-              No chat messages yet. Ask a question!
+            <div className="chat-empty">
+              <MessageCircle size={28} />
+              <span>No messages yet.</span>
+              <span>Say something or ask a question!</span>
             </div>
           ) : (
             messages.map((msg) => {
               const isSelf = msg.sender === username;
-              let bubbleClass = isSelf ? "message-bubble outgoing" : "message-bubble incoming";
-              if (msg.botType === "dost") bubbleClass = "message-bubble dost-msg";
-              if (msg.botType === "sathi") bubbleClass = "message-bubble sathi-msg";
+              const isDostMsg = msg.botType === "dost";
+              const isSathiMsg = msg.botType === "sathi";
+
+              let rowClass = "message-row";
+              if (isSelf) rowClass += " outgoing";
+
+              let initialClass = "message-initial human-msg";
+              if (isSelf) initialClass = "message-initial self-msg";
+              if (isDostMsg) initialClass = "message-initial dost-msg";
+              if (isSathiMsg) initialClass = "message-initial sathi-msg";
+
+              let textClass = "message-text";
+              if (isDostMsg) textClass += " dost-accent";
+              if (isSathiMsg) textClass += " sathi-accent";
+
+              const initial = isDostMsg
+                ? "D"
+                : isSathiMsg
+                ? "S"
+                : (msg.sender || "?").charAt(0).toUpperCase();
 
               return (
-                <div key={msg.id} className={bubbleClass}>
-                  <div className="msg-author">{msg.sender} • {msg.timestamp}</div>
-                  <div>{msg.text}</div>
+                <div key={msg.id} className={rowClass}>
+                  <div className={initialClass}>{initial}</div>
+                  <div className="message-content">
+                    <div className="message-meta">
+                      <span className="message-author">{msg.sender}</span>
+                      <span className="message-time">{msg.timestamp}</span>
+                    </div>
+                    <div className={textClass}>{msg.text}</div>
+                  </div>
                 </div>
               );
             })
           )}
+          <div ref={chatEndRef} />
         </div>
 
         <form onSubmit={handleSendMessage} className="chat-input-area">
@@ -312,15 +461,15 @@ function RoomContent({ roomName, username, onLeave }: { roomName: string; userna
             id="chat-input"
             type="text"
             className="chat-input"
-            placeholder="Type a message or question..."
+            placeholder="Type a message…"
             value={inputMsg}
             onChange={(e) => setInputMsg(e.target.value)}
           />
           <button id="send-chat-btn" type="submit" className="send-btn">
-            <Send size={16} />
+            <Send size={14} />
           </button>
         </form>
-      </div>
+      </aside>
     </div>
   );
 }

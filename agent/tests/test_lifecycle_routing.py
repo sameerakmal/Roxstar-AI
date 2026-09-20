@@ -69,16 +69,24 @@ async def test_gate2_tts_secondary_suppression():
 
 @pytest.mark.anyio
 async def test_both_selected_allows_both_sequentially():
-    """Proves: both selected -> both bots return None (allowed) for LLM invocation."""
+    """Proves: both selected -> Order 1 allows LLM (None), Order 2 suppresses immediate LLM (False)."""
     chat_ctx_dost = llm.ChatContext().append(role="user", text="Dost aur Sathi, dono AI ke baare mein batao")
     dost_res = await agent.before_llm_cb(None, chat_ctx_dost, is_sathi=False)
-    assert dost_res is None, "Dost must return None when both are selected."
+    assert dost_res is None, "Dost (order 1) must return None when both are selected."
 
     class MockRoom:
         remote_participants = {}
 
     sathi_res = await agent.before_llm_cb(None, chat_ctx_dost, is_sathi=True, room=MockRoom())
-    assert sathi_res is None, "Sathi must return None when both are selected."
+    assert sathi_res is False, "Sathi (order 2) must return False to suppress immediate LLM until order 1 completes."
+
+    # Reverse order test: Sathi first, Dost second
+    chat_ctx_rev = llm.ChatContext().append(role="user", text="Sathi, pehle answer karo. Dost, baad mein example dena.")
+    sathi_res_rev = await agent.before_llm_cb(None, chat_ctx_rev, is_sathi=True)
+    assert sathi_res_rev is None, "Sathi (order 1) must return None when ordered first."
+
+    dost_res_rev = await agent.before_llm_cb(None, chat_ctx_rev, is_sathi=False)
+    assert dost_res_rev is False, "Dost (order 2) must return False when ordered second."
 
 @pytest.mark.anyio
 async def test_explicit_sathi_no_second_path_dost_trigger():

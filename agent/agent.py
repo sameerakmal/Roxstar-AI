@@ -15,7 +15,7 @@ import sys
 import time
 import json
 import re
-from typing import AsyncIterable
+from typing import AsyncIterable, Optional, List
 from dotenv import load_dotenv
 
 from livekit.agents import (
@@ -33,7 +33,12 @@ from livekit.plugins import groq, openai, silero
 from openai import AsyncOpenAI
 import openai as openai_sdk
 from edge_tts_wrapper import EdgeTTS
-from router import route_turn
+from router import (
+    route_turn,
+    parse_ordered_plan,
+    MultiBotPlan,
+    MultiBotTarget,
+)
 from room_context import (
     RoomHistoryManager,
     RoomTurn,
@@ -80,6 +85,43 @@ def sanitize_log_message(msg: str) -> str:
     # Mask Authorization headers / bearer tokens
     msg = re.sub(r'(?:bearer|token|key|secret)[=:\s]+["\']?[a-zA-Z0-9_\-]{14,}["\']?', '[REDACTED_CREDENTIAL]', msg, flags=re.IGNORECASE)
     return msg
+
+# Phase 7: Multi-Bot Ordered Orchestration State Manager
+class OrchestrationManager:
+    """Manages multi-bot turn sequencing, pending plans, and completion coordination."""
+    def __init__(self):
+        self.current_plan: Optional[MultiBotPlan] = None
+        self.my_order: Optional[int] = None
+        self.pending_order2_plan: Optional[MultiBotPlan] = None
+        self.order2_task: Optional[asyncio.Task] = None
+        self.is_interrupted: bool = False
+        self.is_text_chat: bool = False
+
+    def reset(self, plan: Optional[MultiBotPlan] = None, my_order: Optional[int] = None, is_text_chat: bool = False):
+        self.current_plan = plan
+        self.my_order = my_order
+        self.is_interrupted = False
+        self.is_text_chat = is_text_chat
+        if self.order2_task and not self.order2_task.done():
+            self.order2_task.cancel()
+        self.order2_task = None
+        self.pending_order2_plan = None
+
+    def mark_order1_finished(self):
+        self.current_plan = None
+        self.my_order = None
+
+    def cancel_current_plan(self):
+        self.current_plan = None
+        self.my_order = None
+        self.pending_order2_plan = None
+        self.is_interrupted = False
+        self.is_text_chat = False
+        if self.order2_task and not self.order2_task.done():
+            self.order2_task.cancel()
+        self.order2_task = None
+
+global_orchestrator = OrchestrationManager()
 
 # Graceful Groq STT Subclass for Rate Limit & Network Error Handling
 class GracefulGroqSTT(groq.STT):
@@ -318,16 +360,149 @@ def before_tts_cb(agent_inst: VoicePipelineAgent | None, text: str | AsyncIterab
         return _resilient_tts_stream(text, bot_name=bot_name, agent_inst=agent_inst)
     return text
 
+# Phase 7: Order 2 Delayed Execution
+async def _execute_order2_response(
+    agent_inst: VoicePipelineAgent,
+    plan: MultiBotPlan,
+    room_history: RoomHistoryManager,
+    room: rtc.Room,
+    first_bot_content: str = "",
+    orchestrator: OrchestrationManager | None = None,
+    is_sathi: bool | None = None,
+    is_text_chat: bool = False,
+):
+    orch = orchestrator if orchestrator is not None else global_orchestrator
+    if is_sathi is None:
+        is_sathi = IS_SATHI
+
+    bot_key = "sathi" if is_sathi else "dost"
+    bot_display_name = "Roxstar AI Sathi" if is_sathi else "Roxstar AI Dost"
+    other_name = "Roxstar AI Dost" if is_sathi else "Roxstar AI Sathi"
+    speaker = SPEAKER_SATHI if is_sathi else SPEAKER_DOST
+    other_speaker = SPEAKER_DOST if is_sathi else SPEAKER_SATHI
+
+    if orch.is_interrupted:
+        logger.info(f"[{bot_display_name}] [Orchestration] Suppressing order 2 execution because plan was interrupted.")
+        return
+
+    my_target = next((t for t in plan.targets if t.bot == bot_key), None)
+    if not my_target:
+        return
+
+    logger.info(
+        f"[{bot_display_name}] [Orchestration] Executing order 2 response for plan {plan.turn_id}. "
+        f"Instruction: '{my_target.instruction}' | Context length from first bot: {len(first_bot_content)}"
+    )
+
+    try:
+        # Ensure first bot's content is in room history before building LLM context
+        if first_bot_content and room_history:
+            recent_turns = getattr(room_history, "turns", [])[-5:]
+            has_first_turn = any(
+                getattr(t, "speaker", "") == other_speaker and getattr(t, "text", "").strip() == first_bot_content.strip()
+                for t in recent_turns
+            )
+            if not has_first_turn:
+                other_turn = room_history.create_bot_turn(other_speaker, first_bot_content)
+                room_history.add_turn(other_turn)
+
+        sys_prompt = SATHI_SYSTEM_PROMPT if is_sathi else DOST_SYSTEM_PROMPT
+
+        if first_bot_content:
+            enrichment = (
+                f"\n\n[Instruction for this turn]: The user asked {other_name} to respond before you.\n"
+                f"{other_name} answered: \"{first_bot_content}\"\n"
+                f"Now it is your turn. Your specific instruction from the user is: \"{my_target.instruction}\".\n"
+                f"Directly build upon {other_name}'s explanation. Provide the requested example or follow-up clearly and concisely in natural Hinglish. Do NOT repeat what {other_name} already said."
+            )
+        else:
+            enrichment = (
+                f"\n\n[Instruction for this turn]: The user asked {other_name} to respond before you. "
+                f"They have already answered. Now it is your turn. Focus on: {my_target.instruction}. "
+                f"Do not repeat what was already said. Keep your response relevant and concise."
+            )
+        enriched_prompt = sys_prompt + enrichment
+
+        c_ctx = room_history.build_chat_context(enriched_prompt, is_sathi=is_sathi)
+
+        reply_text = ""
+        try:
+            stream = agent_inst.llm.chat(chat_ctx=c_ctx)
+            async for chunk in stream:
+                if orch.is_interrupted:
+                    logger.info(f"[{bot_display_name}] [Orchestration] Interrupted during order 2 LLM generation.")
+                    return
+                if chunk.choices and chunk.choices[0].delta.content:
+                    reply_text += chunk.choices[0].delta.content
+        except Exception as llm_err:
+            clean_err = sanitize_log_message(str(llm_err))
+            logger.error(f"[LLM] bot={bot_display_name} event=provider_error error='{clean_err}'")
+            reply_text = (
+                "Kuch technical problem aa gayi hai. Kripya ek baar phir poochhiye."
+                if is_sathi
+                else "Thoda technical issue aa gaya. Ek baar phir poochho."
+            )
+
+        if orch.is_interrupted:
+            return
+
+        clean_reply = strip_speaker_labels(reply_text)
+        if not clean_reply:
+            clean_reply = (
+                "Kuch technical problem aa gayi hai. Kripya ek baar phir poochhiye."
+                if is_sathi
+                else "Thoda technical issue aa gaya. Ek baar phir poochho."
+            )
+
+        bot_turn = room_history.create_bot_turn(speaker, clean_reply)
+        b_added = room_history.add_turn(bot_turn)
+        if b_added and room and getattr(room, "local_participant", None):
+            try:
+                payload = room_history.serialize_turn_event(bot_turn)
+                await room.local_participant.publish_data(payload, topic="room_context", reliable=True)
+            except Exception as pub_err:
+                clean_err = sanitize_log_message(str(pub_err))
+                logger.warning(f"[ROOM] event=context_sync_error error='{clean_err}'")
+
+        if is_text_chat:
+            chat_msg = {
+                "id": str(int(time.time() * 1000)),
+                "sender": bot_display_name,
+                "text": clean_reply,
+                "timestamp": time.strftime("%I:%M %p"),
+                "isBot": True,
+                "botType": bot_key,
+            }
+            try:
+                payload = json.dumps(chat_msg).encode("utf-8")
+                if room and getattr(room, "local_participant", None):
+                    await room.local_participant.publish_data(payload, topic="chat", reliable=True)
+            except Exception as pub_err:
+                clean_err = sanitize_log_message(str(pub_err))
+                logger.warning(f"[ROOM] event=chat_publish_error error='{clean_err}'")
+
+        if not orch.is_interrupted:
+            logger.info(f"[{bot_display_name}] [Orchestration] Speaking order 2 response: '{clean_reply[:50]}...'")
+            await agent_inst.say(clean_reply, allow_interruptions=True)
+    except asyncio.CancelledError:
+        logger.info(f"[{bot_display_name}] [Orchestration] Order 2 response task cancelled.")
+    except Exception as err:
+        clean_err = sanitize_log_message(str(err))
+        logger.error(f"[{bot_display_name}] [Orchestration] Order 2 execution error: {clean_err}")
+
 async def before_llm_cb(
     agent_inst: VoicePipelineAgent | None,
     chat_ctx: llm.ChatContext,
     is_sathi: bool | None = None,
     room: rtc.Room | None = None,
     room_history: RoomHistoryManager | None = None,
+    orchestrator: OrchestrationManager | None = None,
 ):
     if is_sathi is None:
         is_sathi = IS_SATHI
     bot_name = "Sathi" if is_sathi else "Dost"
+    bot_key = "sathi" if is_sathi else "dost"
+    orch = orchestrator if orchestrator is not None else global_orchestrator
     turn_start_time = time.time()
     task_id = f"{bot_name.lower()}-task-{int(turn_start_time * 1000) % 100000}"
     if agent_inst is not None:
@@ -364,6 +539,7 @@ async def before_llm_cb(
         logger.info(f"[{bot_name}] [Turn Lifecycle] callback return value=False (empty/continue prompt)")
         return False
 
+
     # Determine turn routing deterministically from user input
     selected_agent = route_turn(user_input_clean)
     is_sel = (selected_agent in ("dost", "both")) if not is_sathi else (selected_agent in ("sathi", "both"))
@@ -378,6 +554,53 @@ async def before_llm_cb(
         if agent_inst is not None:
             agent_inst.interrupt(interrupt_all=True)
         return False
+
+    # Phase 7: Multi-bot ordered orchestration handling
+    plan: Optional[MultiBotPlan] = None
+    if selected_agent == "both":
+        plan = parse_ordered_plan(user_input_clean)
+        if plan:
+            my_target = next((t for t in plan.targets if t.bot == bot_key), None)
+            other_target = next((t for t in plan.targets if t.bot != bot_key), None)
+
+            # Announce plan on DataChannel
+            if room and hasattr(room, "local_participant") and room.local_participant:
+                try:
+                    plan_announcement = {
+                        "type": "bot_plan_announced",
+                        "turn_id": plan.turn_id,
+                        "targets": [
+                            {"bot": t.bot, "order": t.order, "instruction": t.instruction}
+                            for t in plan.targets
+                        ],
+                        "timestamp": plan.timestamp,
+                        "text": plan.original_text,
+                    }
+                    asyncio.create_task(
+                        room.local_participant.publish_data(
+                            json.dumps(plan_announcement).encode("utf-8"),
+                            topic="bot_orchestration",
+                            reliable=True,
+                        )
+                    )
+                except Exception as ann_err:
+                    clean_err = sanitize_log_message(str(ann_err))
+                    logger.warning(f"[Orchestration] Plan announcement publish error: {clean_err}")
+
+            if my_target and my_target.order == 2:
+                # Order 2: Suppress immediate LLM turn, register pending plan and await order 1 completion
+                logger.info(f"[{bot_name}] [Orchestration] Registered as order 2 for plan {plan.turn_id}. Suppressing immediate LLM turn, awaiting order 1 completion.")
+                orch.reset(plan, my_order=2, is_text_chat=False)
+                orch.pending_order2_plan = plan
+                return False
+
+            # Order 1: Proceeds immediately
+            if my_target and my_target.order == 1:
+                logger.info(f"[{bot_name}] [Orchestration] Registered as order 1 for plan {plan.turn_id}. Proceeding immediately.")
+                orch.reset(plan, my_order=1, is_text_chat=False)
+    else:
+        # Single-bot turn: clear any previous multi-bot plan
+        orch.cancel_current_plan()
 
     logger.info(f"[TurnDebug] bot={bot_name} task={task_id} result=allowed")
     logger.info(f"[BotLifecycle] bot={bot_name} event=before_llm decision=allowed")
@@ -406,9 +629,18 @@ async def before_llm_cb(
         chat_ctx.messages.clear()
         chat_ctx.messages.extend(new_ctx.messages)
 
-    if is_sathi and selected_agent == "both":
-        logger.info(f"[{bot_name}] [Turn Lifecycle] both requested. Sathi waiting for Dost to complete turn...")
-        await asyncio.sleep(3.5)
+    # Phase 7: Context enrichment for order 1 in multi-bot plan
+    if selected_agent == "both" and plan:
+        my_target = next((t for t in plan.targets if t.bot == bot_key), None)
+        other_target = next((t for t in plan.targets if t.bot != bot_key), None)
+        if my_target and my_target.order == 1:
+            other_name = "Roxstar AI Sathi" if not is_sathi else "Roxstar AI Dost"
+            enrichment = (
+                f"\n\n[Instruction for this turn]: The user asked you and {other_name} to respond in sequence. "
+                f"You are answering first. Focus on: {my_target.instruction}. "
+                f"Be concise and direct so {other_name} can add their part."
+            )
+            chat_ctx.append(role="system", text=enrichment)
 
     logger.info(f"[TurnDebug] bot={bot_name} task={task_id} event=llm_started")
     logger.info(f"[BotLifecycle] bot={bot_name} event=llm_started")
@@ -417,6 +649,9 @@ async def before_llm_cb(
 async def entrypoint(ctx: JobContext):
     logger.info(f"[{DISPLAY_NAME}] Job received for room: {ctx.room.name}")
     
+    # Phase 7: Clean reset orchestration manager for each new room session
+    global_orchestrator.cancel_current_plan()
+
     # Initialize Phase 4 RoomHistoryManager for this room session
     room_history = RoomHistoryManager(max_turns=20)
 
@@ -500,7 +735,14 @@ async def entrypoint(ctx: JobContext):
 
     # 6. Deterministic Voice Turn Routing Callbacks
     async def _before_llm(agent_inst: VoicePipelineAgent, chat_ctx: llm.ChatContext):
-        return await before_llm_cb(agent_inst, chat_ctx, is_sathi=IS_SATHI, room=ctx.room, room_history=room_history)
+        return await before_llm_cb(
+            agent_inst,
+            chat_ctx,
+            is_sathi=IS_SATHI,
+            room=ctx.room,
+            room_history=room_history,
+            orchestrator=global_orchestrator,
+        )
 
     def _before_tts(agent_inst: VoicePipelineAgent, text: str | AsyncIterable[str]):
         return before_tts_cb(agent_inst, text, is_sathi=IS_SATHI)
@@ -523,11 +765,42 @@ async def entrypoint(ctx: JobContext):
     @agent.on("user_started_speaking")
     def _on_user_started_speaking():
         logger.info(f"[{DISPLAY_NAME} VAD] User started speaking (interrupting any active agent speech)...")
+        # If order 2 execution task is actively running, cancel it
+        if global_orchestrator.order2_task and not global_orchestrator.order2_task.done():
+            logger.info(f"[{DISPLAY_NAME}] [Orchestration] Interrupting active order 2 execution task.")
+            global_orchestrator.order2_task.cancel()
+            global_orchestrator.is_interrupted = True
+
+        # If this bot was actively speaking as order 1 in a multi-bot plan, broadcast cancellation
+        if global_orchestrator.current_plan and global_orchestrator.my_order == 1:
+            logger.info(f"[{DISPLAY_NAME}] [Orchestration] Order 1 interrupted by user speech. Broadcasting cancellation.")
+            global_orchestrator.is_interrupted = True
+            plan_turn_id = global_orchestrator.current_plan.turn_id
+            cancel_payload = {
+                "type": "bot_plan_cancelled",
+                "turn_id": plan_turn_id,
+                "bot": BOT_KEY,
+                "reason": "user_interruption",
+            }
+            global_orchestrator.cancel_current_plan()
+            if ctx.room and getattr(ctx.room, "local_participant", None):
+                async def _safe_publish_cancel(payload_bytes: bytes):
+                    try:
+                        await ctx.room.local_participant.publish_data(payload_bytes, topic="bot_orchestration", reliable=True)
+                    except Exception:
+                        pass
+                try:
+                    payload = json.dumps(cancel_payload).encode("utf-8")
+                    asyncio.create_task(_safe_publish_cancel(payload))
+                except Exception:
+                    pass
+
         agent.interrupt(interrupt_all=True)
 
     @agent.on("user_stopped_speaking")
     def _on_user_stopped_speaking():
         logger.info(f"[{DISPLAY_NAME} VAD] User stopped speaking.")
+        global_orchestrator.is_interrupted = False
 
     @agent.on("agent_started_speaking")
     def _on_agent_started_speaking():
@@ -569,10 +842,51 @@ async def entrypoint(ctx: JobContext):
                     clean_err = sanitize_log_message(str(pub_err))
                     logger.warning(f"[ROOM] event=context_sync_error error='{clean_err}'")
 
+        # Phase 7: If this bot was order 1 in an active multi-bot plan and not interrupted, publish completion!
+        if (
+            global_orchestrator.current_plan
+            and global_orchestrator.my_order == 1
+            and not global_orchestrator.is_interrupted
+        ):
+            plan_turn_id = global_orchestrator.current_plan.turn_id
+            logger.info(
+                f"[Orchestration] bot={DISPLAY_NAME} event=publish_completion "
+                f"turn_id={plan_turn_id} order=1 content='{clean_content[:60]}...'"
+            )
+            plan_text = global_orchestrator.current_plan.original_text if global_orchestrator.current_plan else ""
+            completion_payload = {
+                "type": "bot_turn_complete",
+                "turn_id": plan_turn_id,
+                "bot": BOT_KEY,
+                "order": 1,
+                "content": clean_content,
+                "plan_text": plan_text,
+                "is_text_chat": False,
+            }
+            global_orchestrator.mark_order1_finished()
+            if ctx.room and getattr(ctx.room, "local_participant", None):
+                async def _safe_publish_orch(payload_bytes: bytes, t_id: str):
+                    try:
+                        logger.info(f"[Orchestration] bot={DISPLAY_NAME} event=publishing_datachannel topic=bot_orchestration turn_id={t_id}")
+                        await ctx.room.local_participant.publish_data(payload_bytes, topic="bot_orchestration", reliable=True)
+                        logger.info(f"[Orchestration] bot={DISPLAY_NAME} event=published_datachannel_success topic=bot_orchestration turn_id={t_id}")
+                    except Exception as pub_err:
+                        clean_err = sanitize_log_message(str(pub_err))
+                        logger.error(f"[Orchestration] bot={DISPLAY_NAME} event=publish_completion_failed turn_id={t_id} error='{clean_err}'")
+
+                try:
+                    payload = json.dumps(completion_payload).encode("utf-8")
+                    asyncio.create_task(_safe_publish_orch(payload, plan_turn_id))
+                except Exception as pub_err:
+                    clean_err = sanitize_log_message(str(pub_err))
+                    logger.error(f"[Orchestration] Failed to schedule completion: {clean_err}")
+
     # 7. Text Chat Handling & Room Context Synchronization over DataChannel
-    async def handle_text_chat_response(text: str, wait_for_dost: bool = False):
-        if wait_for_dost:
-            await asyncio.sleep(2.5)
+    async def handle_text_chat_response(
+        text: str,
+        plan: MultiBotPlan | None = None,
+        order: int = 1,
+    ):
         try:
             clean_text = strip_speaker_labels(text)
             human_turn = room_history.create_human_turn(clean_text)
@@ -585,7 +899,19 @@ async def entrypoint(ctx: JobContext):
                     clean_err = sanitize_log_message(str(pub_err))
                     logger.warning(f"[ROOM] event=context_sync_error error='{clean_err}'")
 
-            c_ctx = room_history.build_chat_context(SYSTEM_PROMPT, is_sathi=IS_SATHI)
+            sys_prompt = SYSTEM_PROMPT
+            if plan and order == 1:
+                my_target = next((t for t in plan.targets if t.bot == BOT_KEY), None)
+                other_name = "Roxstar AI Sathi" if not IS_SATHI else "Roxstar AI Dost"
+                if my_target:
+                    enrichment = (
+                        f"\n\n[Instruction for this turn]: The user asked you and {other_name} to respond in sequence. "
+                        f"You are answering first. Focus on: {my_target.instruction}. "
+                        f"Be concise and direct so {other_name} can add their part."
+                    )
+                    sys_prompt = sys_prompt + enrichment
+
+            c_ctx = room_history.build_chat_context(sys_prompt, is_sathi=IS_SATHI)
             reply_text = ""
             try:
                 stream = agent.llm.chat(chat_ctx=c_ctx)
@@ -631,6 +957,36 @@ async def entrypoint(ctx: JobContext):
                 payload = json.dumps(chat_msg).encode("utf-8")
                 await ctx.room.local_participant.publish_data(payload, topic="chat", reliable=True)
                 await agent.say(clean_reply, allow_interruptions=True)
+
+                # Signal completion if order 1
+                if plan and order == 1 and global_orchestrator.current_plan and not global_orchestrator.is_interrupted:
+                    plan_turn_id = plan.turn_id
+                    logger.info(
+                        f"[Orchestration] bot={DISPLAY_NAME} event=publish_completion text_chat=true "
+                        f"turn_id={plan_turn_id} order=1 content='{clean_reply[:60]}...'"
+                    )
+                    completion_payload = {
+                        "type": "bot_turn_complete",
+                        "turn_id": plan_turn_id,
+                        "bot": BOT_KEY,
+                        "order": 1,
+                        "content": clean_reply,
+                        "plan_text": plan.original_text if plan else "",
+                        "is_text_chat": True,
+                    }
+                    global_orchestrator.mark_order1_finished()
+                    if ctx.room and getattr(ctx.room, "local_participant", None):
+                        try:
+                            logger.info(f"[Orchestration] bot={DISPLAY_NAME} event=publishing_datachannel topic=bot_orchestration turn_id={plan_turn_id}")
+                            await ctx.room.local_participant.publish_data(
+                                json.dumps(completion_payload).encode("utf-8"),
+                                topic="bot_orchestration",
+                                reliable=True,
+                            )
+                            logger.info(f"[Orchestration] bot={DISPLAY_NAME} event=published_datachannel_success topic=bot_orchestration turn_id={plan_turn_id}")
+                        except Exception as pub_err:
+                            clean_err = sanitize_log_message(str(pub_err))
+                            logger.error(f"[Orchestration] bot={DISPLAY_NAME} event=publish_completion_failed turn_id={plan_turn_id} error='{clean_err}'")
         except Exception as err:
             clean_err = sanitize_log_message(str(err))
             logger.error(f"[{DISPLAY_NAME}] Text chat response generation error: {clean_err}")
@@ -639,12 +995,144 @@ async def entrypoint(ctx: JobContext):
     def on_data_received(dp: rtc.DataPacket):
         try:
             topic = getattr(dp, "topic", "")
+            data_bytes = getattr(dp, "data", b"")
+            sender_identity = getattr(getattr(dp, "participant", None), "identity", "unknown")
+
+            logger.info(
+                f"[DataChannel] bot={DISPLAY_NAME} event=data_received topic='{topic}' "
+                f"bytes={len(data_bytes)} participant='{sender_identity}'"
+            )
 
             # Topic "room_context": Room history turn synchronization across processes
             if topic == "room_context":
-                turn = room_history.deserialize_turn_event(dp.data)
+                turn = room_history.deserialize_turn_event(data_bytes)
                 if turn:
                     room_history.add_turn(turn)
+                return
+
+            # Topic "bot_orchestration": Multi-bot ordering and completion coordination
+            if topic == "bot_orchestration":
+                try:
+                    raw_str = data_bytes.decode("utf-8")
+                    data = json.loads(raw_str)
+                    msg_type = data.get("type", "")
+                    plan_turn_id = data.get("turn_id", "")
+                    received_bot = data.get("bot", "")
+                    received_order = data.get("order")
+
+                    my_pending = global_orchestrator.pending_order2_plan
+                    my_pending_turn_id = my_pending.turn_id if my_pending else None
+
+                    logger.info(
+                        f"[Orchestration] bot={DISPLAY_NAME} event=orchestration_packet_parsed "
+                        f"msg_type='{msg_type}' received_turn_id='{plan_turn_id}' received_bot='{received_bot}' "
+                        f"received_order={received_order} my_pending_turn_id='{my_pending_turn_id}' "
+                        f"has_pending_plan={my_pending is not None} is_interrupted={global_orchestrator.is_interrupted}"
+                    )
+
+                    if msg_type == "bot_plan_announced":
+                        targets_data = data.get("targets", [])
+                        my_target = next((t for t in targets_data if t.get("bot") == BOT_KEY), None)
+                        if my_target and my_target.get("order") == 2:
+                            logger.info(
+                                f"[Orchestration] bot={DISPLAY_NAME} event=adopting_announced_plan "
+                                f"plan_turn_id='{plan_turn_id}' my_order=2 instruction='{my_target.get('instruction')}'"
+                            )
+                            targets = [
+                                MultiBotTarget(
+                                    bot=t.get("bot", ""),
+                                    order=int(t.get("order", 2)),
+                                    instruction=t.get("instruction", "")
+                                )
+                                for t in targets_data
+                            ]
+                            announced_plan = MultiBotPlan(
+                                turn_id=plan_turn_id,
+                                targets=targets,
+                                timestamp=float(data.get("timestamp", time.time())),
+                                original_text=data.get("text", ""),
+                            )
+                            global_orchestrator.reset(announced_plan, my_order=2, is_text_chat=False)
+                            global_orchestrator.pending_order2_plan = announced_plan
+                            agent.interrupt(interrupt_all=True)
+
+                    elif msg_type == "bot_turn_complete":
+                        is_text_chat = bool(data.get("is_text_chat", False)) or getattr(global_orchestrator, "is_text_chat", False)
+                        turn_id_match = (
+                            my_pending is not None
+                            and my_pending.turn_id == plan_turn_id
+                        )
+                        # Soft match fallback: if turn_id hashes diverged across processes due to STT formatting,
+                        # release order 2 if we have a pending plan, received order 1 from the other bot, and not interrupted
+                        order_match = (
+                            my_pending is not None
+                            and received_order == 1
+                            and received_bot != BOT_KEY
+                        )
+
+                        # Secondary plan_text fallback if pending plan was not set prior to completion
+                        plan_to_execute = my_pending
+                        match_type = "exact_turn_id" if turn_id_match else ("order_fallback" if order_match else None)
+
+                        if not plan_to_execute and received_order == 1 and received_bot != BOT_KEY:
+                            plan_text = data.get("plan_text", "")
+                            if plan_text:
+                                reconstructed = parse_ordered_plan(plan_text)
+                                if reconstructed and any(t.bot == BOT_KEY and t.order == 2 for t in reconstructed.targets):
+                                    plan_to_execute = reconstructed
+                                    match_type = "reconstructed_from_plan_text"
+
+                        if plan_to_execute and not global_orchestrator.is_interrupted:
+                            global_orchestrator.pending_order2_plan = None
+                            first_content = data.get("content", "")
+                            logger.info(
+                                f"[Orchestration] bot={DISPLAY_NAME} event=order2_released "
+                                f"plan_turn_id='{plan_to_execute.turn_id}' matched_by='{match_type}' "
+                                f"first_bot='{received_bot}' first_content_len={len(first_content)} "
+                                f"is_text_chat={is_text_chat}"
+                            )
+                            global_orchestrator.order2_task = asyncio.create_task(
+                                _execute_order2_response(
+                                    agent,
+                                    plan_to_execute,
+                                    room_history,
+                                    ctx.room,
+                                    first_bot_content=first_content,
+                                    orchestrator=global_orchestrator,
+                                    is_text_chat=is_text_chat,
+                                )
+                            )
+                        else:
+                            reasons = []
+                            if plan_to_execute is None:
+                                reasons.append("no_order2_plan")
+                            if global_orchestrator.is_interrupted:
+                                reasons.append("orchestrator_is_interrupted")
+                            if not turn_id_match and not order_match and not plan_to_execute:
+                                reasons.append("turn_and_order_mismatch")
+                            logger.info(
+                                f"[Orchestration] bot={DISPLAY_NAME} event=completion_ignored "
+                                f"reasons='{', '.join(reasons)}' turn_id_match={turn_id_match} "
+                                f"order_match={order_match}"
+                            )
+                    elif msg_type == "bot_plan_cancelled":
+                        turn_id_match = (
+                            my_pending is not None
+                            and my_pending.turn_id == plan_turn_id
+                        )
+                        order_match = (
+                            my_pending is not None
+                            and received_bot != BOT_KEY
+                        )
+                        if turn_id_match or order_match:
+                            logger.info(
+                                f"[Orchestration] bot={DISPLAY_NAME} event=plan_cancelled_received "
+                                f"plan_turn_id='{plan_turn_id}' from_bot='{received_bot}'"
+                            )
+                            global_orchestrator.cancel_current_plan()
+                except Exception as orch_err:
+                    clean_err = sanitize_log_message(str(orch_err))
+                    logger.warning(f"[Orchestration] bot={DISPLAY_NAME} DataChannel receive error: {clean_err}")
                 return
 
             if topic and topic != "chat":
@@ -667,10 +1155,25 @@ async def entrypoint(ctx: JobContext):
             selected_agent = route_turn(text)
             logger.info(f"[{DISPLAY_NAME} DataChannel] Message: '{text}' | Selected agent: {selected_agent}")
 
-            if not IS_SATHI and selected_agent in ("dost", "both"):
+            if selected_agent == "both":
+                plan = parse_ordered_plan(text)
+                if plan:
+                    my_target = next((t for t in plan.targets if t.bot == BOT_KEY), None)
+                    if my_target:
+                        if my_target.order == 1:
+                            global_orchestrator.reset(plan, my_order=1, is_text_chat=True)
+                            asyncio.create_task(handle_text_chat_response(text, plan=plan, order=1))
+                        else:
+                            global_orchestrator.reset(plan, my_order=2, is_text_chat=True)
+                            global_orchestrator.pending_order2_plan = plan
+                            logger.info(
+                                f"[{DISPLAY_NAME}] [Orchestration] Text chat registered as order 2 for plan {plan.turn_id}. "
+                                f"Awaiting order 1 completion."
+                            )
+            elif not IS_SATHI and selected_agent == "dost":
                 asyncio.create_task(handle_text_chat_response(text))
-            elif IS_SATHI and selected_agent in ("sathi", "both"):
-                asyncio.create_task(handle_text_chat_response(text, wait_for_dost=(selected_agent == "both")))
+            elif IS_SATHI and selected_agent == "sathi":
+                asyncio.create_task(handle_text_chat_response(text))
         except Exception as e:
             clean_err = sanitize_log_message(str(e))
             logger.error(f"[{DISPLAY_NAME} DataChannel Error]: {clean_err}")
@@ -694,6 +1197,7 @@ async def entrypoint(ctx: JobContext):
             logger.info(f"[CONNECTION] Human participant '{p.identity}' left room.")
             human_participant = None
             agent.interrupt(interrupt_all=True)
+            global_orchestrator.cancel_current_plan()
 
     # 8. Start VoicePipelineAgent linked exclusively to human participant
     if human_participant is not None:
