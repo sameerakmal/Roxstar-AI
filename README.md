@@ -11,29 +11,6 @@ A real-time, multi-user voice room powered by **LiveKit WebRTC**, featuring two 
 
 ---
 
-## Demo
-
-| Resource | Link |
-| :--- | :--- |
-| **Demo Video** | [Watch Demo Walkthrough (Placeholder)](#) *(5–10 min complete demonstration)* |
-| **Live Web App** | [Launch Live Room (Placeholder)](#) |
-| **GitHub Repository** | [sameerakmal/Roxstar-AI](https://github.com/sameerakmal/Roxstar-AI) |
-
-### What the Demo Shows
-
-1. **End-to-End Voice Flow**: Live microphone input through WebRTC audio to speech synthesis with sub-second responsiveness.
-2. **Natural Hindi/Hinglish**: Everyday conversational Hindi/Hinglish mixing technical terms naturally, avoiding textbook phrasing.
-3. **English Understanding**: Full comprehension of spoken English queries with natural Hinglish or English responses.
-4. **Multi-Turn Room Memory**: Natural follow-ups (*"Iske baare mein aur batao"*, *"Can you give an example?"*) using conversation history.
-5. **Multi-User Room Context**: Human participant turns and bot responses are attributed and synchronized across participants.
-6. **Session Memory**: In-memory sliding window preserves conversational context across turns within a room session.
-7. **Interruption / Barge-in**: Speaking while a bot speaks immediately halts playback and cancels ongoing speech synthesis.
-8. **Deterministic Two-Bot Routing**: Direct addressing (*"Dost, batao"* vs *"Sathi, samjhao"*) and unaddressed queries routed to the default bot.
-9. **Ordered Dost → Sathi Orchestration**: Sequential handoffs (*"AI Dost, tum answer karo. AI Sathi, example dena"*) coordinated via WebRTC DataChannel completion events without arbitrary delays.
-10. **Provider Resilience & Graceful Fallback**: Graceful error interception and fallback audio playback upon provider failure with seamless recovery on subsequent turns.
-
----
-
 ## Key Features
 
 | Category | Capability | Implementation Detail |
